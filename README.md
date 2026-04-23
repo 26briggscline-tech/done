@@ -1,4 +1,9 @@
+import sys
+sys.stdout.reconfigure(errors='replace')
+
 import cv2
+import os
+import time
 from picamera2 import Picamera2
 import onnxruntime as ort
 import numpy as np
@@ -6,7 +11,7 @@ from adafruit_servokit import ServoKit
 
 # --- Camera Setup ---
 cam_info = Picamera2.global_camera_info()
-print(f"Available cameras: {cam_info}")
+print(f"Available cameras: {str(cam_info).encode('utf-8', errors='replace').decode('utf-8')}")
 if len(cam_info) == 0:
     raise RuntimeError("No cameras detected.")
 
@@ -17,8 +22,12 @@ picam2.start()
 
 FRAME_W = 640
 FRAME_H = 480
-FRAME_CX = FRAME_W // 2  # 320
-FRAME_CY = FRAME_H // 2  # 240
+FRAME_CX = FRAME_W // 2
+FRAME_CY = FRAME_H // 2
+
+# --- Rule of Thirds Target (top-left intersection) ---
+TARGET_X = FRAME_W // 3   # 213
+TARGET_Y = FRAME_H // 3   # 160
 
 # --- Model Setup ---
 session = ort.InferenceSession("/home/lick/version-RFB-320.onnx")
@@ -31,15 +40,29 @@ kit.servo[1].set_pulse_width_range(500, 2500)  # Pan
 TILT_MIN, TILT_MAX = 30, 150
 PAN_MIN,  PAN_MAX  = 30, 150
 
-tilt_angle = 90.0
-pan_angle  = 90.0
+tilt_angle = 75.0
+pan_angle  = 45.0
 kit.servo[0].angle = tilt_angle
 kit.servo[1].angle = pan_angle
 
 # --- Tuning ---
-PAN_SPEED  = 0.0005  # increase if too slow, decrease if too twitchy
-TILT_SPEED = 0.0005
-DEADZONE   = 20    # pixels - don't move if error is smaller than this
+PAN_SPEED  = 0.005
+TILT_SPEED = 0.005
+DEADZONE   = 20
+
+# --- Video Writer Setup ---
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+desktop_path = os.path.expanduser("~/Desktop/")
+CHUNK_FRAMES = 900  # 30 seconds Ã 30 fps
+
+def new_writer():
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(desktop_path, f'face_tracking_{timestamp}.mp4')
+    print(f"Recording to: {str(filename).encode('utf-8', errors='replace').decode('utf-8')}")
+    return cv2.VideoWriter(filename, fourcc, 30.0, (FRAME_W, FRAME_H))
+
+out = new_writer()
+frame_count = 0
 
 # --- Face Detection ---
 def detect_faces(frame, threshold=0.7, nms_threshold=0.4):
@@ -82,20 +105,16 @@ def detect_faces(frame, threshold=0.7, nms_threshold=0.4):
 
     return []
 
-# --- Servo Control ---
+# --- Servo Control (target = top-left rule-of-thirds intersection) ---
 def update_servos(face_cx, face_cy):
     global tilt_angle, pan_angle
 
-    # Error = how far face center is from frame center
-    error_x = face_cx - FRAME_CX   # positive = face is right of center
-    error_y = face_cy - FRAME_CY   # positive = face is below center
+    error_x = face_cx - TARGET_X
+    error_y = face_cy - TARGET_Y
 
-    # Pan: move toward face to shorten the line to center
-    # If panning the wrong way, flip += to -=
     if abs(error_x) > DEADZONE:
         pan_angle += error_x * PAN_SPEED
 
-    # Tilt: face below center -> tilt down (decrease angle)
     if abs(error_y) > DEADZONE:
         tilt_angle -= error_y * TILT_SPEED
 
@@ -115,31 +134,22 @@ try:
             frame = frame[:, :, :3]
 
         display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        faces   = detect_faces(frame)
+
+        faces = detect_faces(frame)
 
         if faces:
-            # Pick highest confidence face
             best = max(faces, key=lambda f: f[6])
             x1, y1, x2, y2, cx, cy, conf = best
-
             update_servos(cx, cy)
 
-            # Draw box
-            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            # Draw face center dot
-            cv2.circle(display, (cx, cy), 6, (0, 255, 0), -1)
-            # Draw line from face center to frame center
-            cv2.line(display, (cx, cy), (FRAME_CX, FRAME_CY), (0, 255, 255), 1)
-            cv2.putText(display, f"{conf:.2f}", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        out.write(display)
+        frame_count += 1
 
-        # Draw frame center crosshair
-        cv2.drawMarker(display, (FRAME_CX, FRAME_CY), (0, 0, 255),
-                       cv2.MARKER_CROSS, 30, 2)
-
-        # HUD
-        cv2.putText(display, f"Tilt: {round(tilt_angle)}  Pan: {round(pan_angle)}",
-                    (10, FRAME_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Rotate video file every 30 seconds
+        if frame_count >= CHUNK_FRAMES:
+            out.release()
+            out = new_writer()
+            frame_count = 0
 
         cv2.imshow("Face Tracking", display)
 
@@ -148,9 +158,13 @@ try:
 
 finally:
     picam2.stop()
+    out.release()
     cv2.destroyAllWindows()
     kit.servo[0].angle = 90
     kit.servo[1].angle = 90
     print("Stopped. Servos centered.")
     
+
+
+
 
